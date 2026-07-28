@@ -1,0 +1,14 @@
+{
+  "version": "4.0.0",
+  "lookback_games": 10,
+  "top_overall": 10,
+  "top_per_game": 4,
+  "weights": {
+    "recent_power": 0.5,
+    "pitcher_leak": 0.25,
+    "due": 0.15,
+    "environment": 0.1
+  },
+  "small_pitcher_sample_bbe": 25,
+  "full_pitcher_sample_bbe": 50
+}
