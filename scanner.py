@@ -63,6 +63,22 @@ DEFAULT_WEIGHTS = {
     "market_value": 0.05,
 }
 
+# These are used only to validate roster eligibility. Confirmed batting orders
+# always take precedence because a player listed in the official lineup is
+# eligible for that game.
+INACTIVE_TRANSACTION_TERMS = (
+    "optioned", "reassigned", "injured list", "disabled list",
+    "designated for assignment", "released", "suspended",
+    "restricted list", "bereavement list", "paternity list",
+    "family medical emergency list", "outrighted", "transferred to the 60-day",
+    "placed on the 10-day", "placed on the 15-day", "placed on the 60-day",
+)
+ACTIVE_TRANSACTION_TERMS = (
+    "recalled", "activated", "reinstated", "selected the contract",
+    "contract selected", "purchased the contract", "returned from",
+    "added to the active roster",
+)
+
 
 @dataclass
 class GameContext:
@@ -123,47 +139,245 @@ def schedule_for_date(game_date: str) -> list[GameContext]:
     return games
 
 
-def confirmed_lineup(game_pk: int) -> tuple[list[dict], list[dict]]:
-    """Returns away, home lineups. Empty lists mean not yet posted."""
+def game_lineups_and_rosters(
+    game_pk: int,
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Return confirmed lineups and game-level eligible hitter rosters.
+
+    The live boxscore frequently exposes the game roster before the batting
+    order is posted. That roster is preferred over the broader team endpoint
+    because it reflects eligibility for the selected game.
+    """
     payload = get_json(LIVE_FEED.format(game_pk=game_pk))
     box = payload.get("liveData", {}).get("boxscore", {}).get("teams", {})
-    result = []
+    lineups: list[list[dict]] = []
+    rosters: list[list[dict]] = []
+
     for side in ("away", "home"):
-        team_box = box.get(side, {})
-        order = team_box.get("battingOrder") or []
+        team_box = box.get(side, {}) or {}
+        order = [int(pid) for pid in (team_box.get("battingOrder") or [])]
         players = team_box.get("players") or {}
-        lineup = []
-        for slot, pid in enumerate(order, start=1):
-            key = f"ID{pid}"
-            p = players.get(key, {})
-            person = p.get("person", {})
-            position = p.get("position", {}).get("abbreviation")
-            lineup.append({
-                "player_id": int(pid),
+        by_id: dict[int, dict] = {}
+
+        for player_data in players.values():
+            person = player_data.get("person") or {}
+            pid = person.get("id")
+            if pid is None:
+                continue
+            pid = int(pid)
+            position = player_data.get("position") or {}
+            position_type = str(position.get("type", ""))
+            status = player_data.get("status") or {}
+            status_text = " ".join(
+                str(status.get(key, "")) for key in ("code", "description")
+            ).lower()
+
+            # Never discard an official batting-order player. Otherwise remove
+            # explicit inactive statuses and pitcher-only entries.
+            if pid not in order:
+                if any(term in status_text for term in (
+                    "injured", "disabled", "inactive", "suspended",
+                    "restricted", "minors", "optioned",
+                )):
+                    continue
+                if position_type == "Pitcher":
+                    continue
+
+            by_id[pid] = {
+                "player_id": pid,
                 "player": person.get("fullName", str(pid)),
-                "lineup_spot": slot,
-                "position": position,
-            })
-        result.append(lineup)
-    return result[0], result[1]
+                "lineup_spot": np.nan,
+                "position": position.get("abbreviation"),
+                "roster_source": "game_boxscore",
+            }
+
+        lineup: list[dict] = []
+        for slot, pid in enumerate(order, start=1):
+            row = by_id.get(pid)
+            if row is None:
+                player_data = players.get(f"ID{pid}", {}) or {}
+                person = player_data.get("person") or {}
+                position = player_data.get("position") or {}
+                row = {
+                    "player_id": pid,
+                    "player": person.get("fullName", str(pid)),
+                    "lineup_spot": slot,
+                    "position": position.get("abbreviation"),
+                    "roster_source": "confirmed_lineup",
+                }
+            else:
+                row = dict(row)
+                row["lineup_spot"] = slot
+                row["roster_source"] = "confirmed_lineup"
+            lineup.append(row)
+
+        lineups.append(lineup)
+        rosters.append(list(by_id.values()))
+
+    return lineups[0], lineups[1], rosters[0], rosters[1]
+
+
+def confirmed_lineup(game_pk: int) -> tuple[list[dict], list[dict]]:
+    """Compatibility wrapper returning only the posted batting orders."""
+    away, home, _, _ = game_lineups_and_rosters(game_pk)
+    return away, home
+
+
+def _entry_status_is_active(entry: dict) -> bool:
+    status = entry.get("status") or {}
+    text = " ".join(
+        str(status.get(key, "")) for key in ("code", "description")
+    ).lower()
+    if not text.strip():
+        return True
+    return not any(term in text for term in (
+        "injured", "disabled", "inactive", "suspended", "restricted",
+        "minors", "optioned", "designated", "released",
+    ))
+
+
+def _people_current_team(person_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Bulk player metadata used to catch optioned/minor-league players."""
+    ids = sorted({int(pid) for pid in person_ids})
+    if not ids:
+        return {}
+    try:
+        payload = get_json(
+            f"{MLB_STATS}/people",
+            {
+                "personIds": ",".join(str(pid) for pid in ids),
+                "hydrate": "currentTeam",
+            },
+        )
+    except Exception:
+        return {}
+
+    result: dict[int, dict[str, Any]] = {}
+    for person in payload.get("people", []) or []:
+        pid = person.get("id")
+        if pid is None:
+            continue
+        current_team = person.get("currentTeam") or {}
+        result[int(pid)] = {
+            "active": person.get("active"),
+            "current_team_id": current_team.get("id"),
+        }
+    return result
+
+
+def _recent_transaction_states(
+    team_id: int,
+    game_date: str,
+    person_ids: list[int],
+    lookback_days: int = 90,
+) -> dict[int, bool]:
+    """Return latest known active/inactive state from MLB transactions.
+
+    True means a recent activation/recall; False means a recent option, IL,
+    DFA, release, suspension, or other inactive transaction. Unknown players
+    are omitted so API gaps do not incorrectly remove them.
+    """
+    ids = {int(pid) for pid in person_ids}
+    if not ids:
+        return {}
+    end_date = pd.Timestamp(game_date).date()
+    start_date = end_date - timedelta(days=lookback_days)
+    try:
+        payload = get_json(
+            f"{MLB_STATS}/transactions",
+            {
+                "teamId": int(team_id),
+                "startDate": start_date.isoformat(),
+                "endDate": end_date.isoformat(),
+                "sportId": 1,
+            },
+        )
+    except Exception:
+        return {}
+
+    latest: dict[int, tuple[pd.Timestamp, bool]] = {}
+    for tx in payload.get("transactions", []) or []:
+        person = tx.get("person") or {}
+        pid = person.get("id")
+        if pid is None or int(pid) not in ids:
+            continue
+        text = " ".join(
+            str(tx.get(key, ""))
+            for key in ("typeCode", "typeDesc", "description")
+        ).lower()
+
+        state: bool | None = None
+        if any(term in text for term in ACTIVE_TRANSACTION_TERMS):
+            state = True
+        elif any(term in text for term in INACTIVE_TRANSACTION_TERMS):
+            state = False
+        if state is None:
+            continue
+
+        tx_date = pd.to_datetime(
+            tx.get("effectiveDate") or tx.get("date"), errors="coerce"
+        )
+        if pd.isna(tx_date):
+            tx_date = pd.Timestamp.min
+        current = latest.get(int(pid))
+        if current is None or tx_date >= current[0]:
+            latest[int(pid)] = (tx_date, state)
+
+    return {pid: state for pid, (_, state) in latest.items()}
 
 
 def fallback_roster(team_id: int, game_date: str) -> list[dict]:
+    """Validated active MLB hitter roster for games without a posted lineup."""
     payload = get_json(
         f"{MLB_STATS}/teams/{team_id}/roster",
-        {"rosterType": "active", "date": game_date},
-    )
-    return [
         {
-            "player_id": int(x["person"]["id"]),
-            "player": x["person"]["fullName"],
-            "lineup_spot": np.nan,
-            "position": x.get("position", {}).get("abbreviation"),
-        }
-        for x in payload.get("roster", [])
+            "rosterType": "active",
+            "date": game_date,
+            "hydrate": "person(currentTeam)",
+        },
+    )
+    entries = [
+        x for x in (payload.get("roster", []) or [])
         if x.get("position", {}).get("type") != "Pitcher"
+        and _entry_status_is_active(x)
     ]
+    if not entries:
+        return []
 
+    person_ids = [int(x["person"]["id"]) for x in entries]
+
+    # Current-team and transaction checks are appropriate for a live slate.
+    # Historical backtests continue to rely on the date-specific roster API.
+    selected_date = date.fromisoformat(game_date)
+    near_current = abs((selected_date - date.today()).days) <= 2
+    people = _people_current_team(person_ids) if near_current else {}
+    transactions = (
+        _recent_transaction_states(team_id, game_date, person_ids)
+        if near_current else {}
+    )
+
+    roster: list[dict] = []
+    for entry in entries:
+        pid = int(entry["person"]["id"])
+        meta = people.get(pid, {})
+        current_team_id = meta.get("current_team_id")
+        explicitly_active = meta.get("active")
+
+        if explicitly_active is False:
+            continue
+        if current_team_id is not None and int(current_team_id) != int(team_id):
+            continue
+        if transactions.get(pid) is False:
+            continue
+
+        roster.append({
+            "player_id": pid,
+            "player": entry["person"].get("fullName", str(pid)),
+            "lineup_spot": np.nan,
+            "position": entry.get("position", {}).get("abbreviation"),
+            "roster_source": "validated_active_roster",
+        })
+    return roster
 
 def team_id_map() -> dict[str, int]:
     payload = get_json(f"{MLB_STATS}/teams", {"sportId": 1})
@@ -171,6 +385,81 @@ def team_id_map() -> dict[str, int]:
         x["abbreviation"]: int(x["id"])
         for x in payload.get("teams", [])
     }
+
+
+def historical_bvp_for_pitcher(
+    batter_ids: list[int],
+    pitcher_id: int | None,
+) -> dict[int, dict[str, float]]:
+    """Fetch career batter-vs-pitcher totals in one request per starter.
+
+    BvP is retained as a small, sample-regressed adjustment. It supplements,
+    rather than replaces, the last-10-game Statcast profile.
+    """
+    if not pitcher_id or not batter_ids:
+        return {}
+    try:
+        payload = get_json(
+            f"{MLB_STATS}/people",
+            {
+                "personIds": ",".join(
+                    str(int(pid)) for pid in sorted(set(batter_ids))
+                ),
+                "hydrate": (
+                    "stats(group=[hitting],type=[vsPlayer],"
+                    f"opposingPlayerId={int(pitcher_id)},sportId=1)"
+                ),
+            },
+        )
+    except Exception:
+        return {}
+
+    result: dict[int, dict[str, float]] = {}
+    for person in payload.get("people", []) or []:
+        pid = person.get("id")
+        if pid is None:
+            continue
+
+        candidates: list[dict[str, Any]] = []
+        for block in person.get("stats", []) or []:
+            for split in block.get("splits", []) or []:
+                stat = split.get("stat") or {}
+                if stat:
+                    candidates.append(stat)
+
+        # The hydration can expose season and total splits. The largest PA
+        # sample is the career matchup and is the appropriate historical input.
+        def number(value: Any) -> float:
+            parsed = pd.to_numeric(value, errors="coerce")
+            return 0.0 if pd.isna(parsed) else float(parsed)
+
+        def pa_value(stat: dict[str, Any]) -> float:
+            return number(stat.get("plateAppearances"))
+
+        stat = max(candidates, key=pa_value) if candidates else {}
+        pa = number(stat.get("plateAppearances"))
+        ab = number(stat.get("atBats"))
+        hits = number(stat.get("hits"))
+        hr = number(stat.get("homeRuns"))
+        doubles = number(stat.get("doubles"))
+        triples = number(stat.get("triples"))
+        walks = number(stat.get("baseOnBalls"))
+        hbp = number(stat.get("hitByPitch"))
+        total_bases = hits + doubles + 2 * triples + 3 * hr
+        avg = hits / ab if ab else np.nan
+        slg = total_bases / ab if ab else np.nan
+        obp_den = ab + walks + hbp
+        obp = (hits + walks + hbp) / obp_den if obp_den else np.nan
+        result[int(pid)] = {
+            "BvP_PA": pa,
+            "BvP_AB": ab,
+            "BvP_H": hits,
+            "BvP_HR": hr,
+            "BvP_AVG": avg,
+            "BvP_OBP": obp,
+            "BvP_SLG": slg,
+        }
+    return result
 
 
 def _coerce_statcast_types(df: pd.DataFrame) -> pd.DataFrame:
@@ -559,6 +848,7 @@ def add_v4_scores(df: pd.DataFrame) -> pd.DataFrame:
       25% pitcher leak by batter side
       15% due indicators
       10% environment
+      plus a sample-regressed historical BvP adjustment capped at +/-5 points
     """
     out = df.copy()
 
@@ -644,16 +934,36 @@ def add_v4_scores(df: pd.DataFrame) -> pd.DataFrame:
         + _fixed_scale(weather, 0.94, 1.06) * 0.30
     ).clip(0, 100)
 
-    # Transparent composite.
-    out["Power_Index"] = (
+    # Historical BvP. Small samples are strongly regressed to neutral.
+    bvp_pa = n("BvP_PA")
+    bvp_hr = n("BvP_HR")
+    bvp_avg = n("BvP_AVG", 0.250)
+    bvp_slg = n("BvP_SLG", 0.400)
+    bvp_hr_rate = (bvp_hr / bvp_pa.replace(0, np.nan)).fillna(0)
+    bvp_raw = (
+        _fixed_scale(bvp_hr_rate, 0.00, 0.12) * 0.40
+        + _fixed_scale(bvp_slg, 0.250, 0.850) * 0.35
+        + _fixed_scale(bvp_avg, 0.150, 0.400) * 0.25
+    )
+    bvp_reliability = (bvp_pa / 30.0).clip(0, 1)
+    out["BvP_Score"] = (50 + (bvp_raw - 50) * bvp_reliability).clip(0, 100)
+    out["BvP_Adjustment"] = ((out["BvP_Score"] - 50) * 0.10).clip(-5, 5)
+    out["BvP_Sample_Flag"] = ""
+    out.loc[bvp_pa == 0, "BvP_Sample_Flag"] = "NO HISTORY"
+    out.loc[(bvp_pa > 0) & (bvp_pa < 10), "BvP_Sample_Flag"] = "⚠ SMALL BvP"
+
+    # Preserve the original V4 weighting and apply BvP only as a bounded overlay.
+    out["Base_Power_Index"] = (
         out["Recent_Power"] * 0.50
         + out["Pitcher_Leak"] * 0.25
         + out["Due_Score_V4"] * 0.15
         + out["Environment"] * 0.10
     ).clip(0, 100)
+    out["Power_Index"] = (out["Base_Power_Index"] + out["BvP_Adjustment"]).clip(0, 100)
 
-    # Bounded, display-only model estimate.
-    likelihood = 0.035 + 0.255 / (1 + np.exp(-(out["Power_Index"] - 66) / 8.5))
+    # Recalibrated display-only estimate: roughly 4%-30%, with a 58 index
+    # near 24%. This changes the display scale, not the underlying rankings.
+    likelihood = 0.035 + 0.265 / (1 + np.exp(-(out["Power_Index"] - 47.0) / 9.0))
     out["HR_Likelihood_pct"] = (likelihood * 100).round().astype(int)
     out["HR_Likelihood"] = out["HR_Likelihood_pct"].astype(str) + "%"
 
@@ -1030,8 +1340,8 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         raise RuntimeError("No Statcast data returned.")
 
     # Preserve the original pitcher matchup window at 32 calendar days.
-    # The wider source download is used only to reconstruct each hitter's
-    # 20 most recent games.
+    # The wider source download is used to reconstruct each hitter's
+    # 10 most recent games.
     pitcher_start = pd.Timestamp(game_date) - pd.Timedelta(days=32)
     season_sc = sc[sc["game_date"] >= pitcher_start].copy()
 
@@ -1045,16 +1355,19 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
     rows = []
     for game in games:
         try:
-            away_lineup, home_lineup = confirmed_lineup(game.game_pk)
+            away_lineup, home_lineup, away_game_roster, home_game_roster = (
+                game_lineups_and_rosters(game.game_pk)
+            )
         except Exception:
             away_lineup, home_lineup = [], []
+            away_game_roster, home_game_roster = [], []
 
-        # Lineup confirmation is reference-only. Always scan the active roster
-        # when a batting order is unavailable.
+        # Confirmed lineups remain optional. When unavailable, prefer the
+        # game-level roster; only then use the validated team active roster.
         if not away_lineup:
-            away_lineup = fallback_roster(ids[game.away], game_date)
+            away_lineup = away_game_roster or fallback_roster(ids[game.away], game_date)
         if not home_lineup:
-            home_lineup = fallback_roster(ids[game.home], game_date)
+            home_lineup = home_game_roster or fallback_roster(ids[game.home], game_date)
 
         game_person_ids = [
             *(p.get("player_id") for p in away_lineup),
@@ -1063,6 +1376,12 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
             game.home_pitcher_id,
         ]
         hand_map = people_handedness(game_person_ids)
+        away_bvp = historical_bvp_for_pitcher(
+            [int(p["player_id"]) for p in away_lineup], game.home_pitcher_id
+        )
+        home_bvp = historical_bvp_for_pitcher(
+            [int(p["player_id"]) for p in home_lineup], game.away_pitcher_id
+        )
 
         for side, lineup, team, opp, pitcher_id, pitcher_name, park_team in [
             ("away", away_lineup, game.away, game.home, game.home_pitcher_id, game.home_pitcher_name, game.home),
@@ -1070,6 +1389,7 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         ]:
             if pitcher_id is None:
                 continue
+            bvp_map = away_bvp if side == "away" else home_bvp
             for hitter in lineup:
                 pid = hitter["player_id"]
                 p20 = last_n_games_for_batter(sc, pid, 10)
@@ -1133,6 +1453,7 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
                     "player": hitter["player"],
                     "lineup_spot": hitter["lineup_spot"],
                     "position": hitter["position"],
+                    "roster_source": hitter.get("roster_source", "unknown"),
                     "bat_side": stand,
                     "batter_profile_side": listed_bat_side,
                     "pitcher_throws": pitcher_throws,
@@ -1146,6 +1467,11 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
                     "HR_Odds_American": hr_odds,
                     "Market_Value_Score": market_value,
                     "Pitch_Mix_Score": pitch_score,
+                    **bvp_map.get(pid, {
+                        "BvP_PA": 0, "BvP_AB": 0, "BvP_H": 0,
+                        "BvP_HR": 0, "BvP_AVG": np.nan,
+                        "BvP_OBP": np.nan, "BvP_SLG": np.nan,
+                    }),
                     **production,
                     **contact,
                     **pv,
@@ -1174,9 +1500,12 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         "Overall_Rank", "Game_Rank", "Player_Display", "HR_Likelihood",
         "Best_Look", "Conviction", "Hot_Symbol", "Due_Meter",
         "opposing_pitcher", "Pitcher_Sample_Flag", "Pitcher_Sample",
-        "Power_Index", "Recent_Power", "Pitcher_Leak", "Due_Score_V4",
-        "Environment", "TANKS", "Porch_Shots", "Top_10_Overall",
-        "Top_4_Per_Game", "team", "opponent", "venue", "lineup_spot",
+        "Power_Index", "Base_Power_Index", "Recent_Power", "Pitcher_Leak",
+        "BvP_Score", "BvP_Adjustment", "BvP_PA", "BvP_AB", "BvP_H",
+        "BvP_HR", "BvP_AVG", "BvP_OBP", "BvP_SLG", "BvP_Sample_Flag",
+        "Due_Score_V4", "Environment", "TANKS", "Porch_Shots",
+        "Top_10_Overall", "Top_4_Per_Game", "team", "opponent", "venue",
+        "lineup_spot", "roster_source",
         "batter_profile_side", "pitcher_throws",
         "HR", "Barrels_approx", "EV_100_plus", "EV_100_plus_outs",
         "Fly_375_plus", "Out_380_400", "Near_HR", "xHR_minus_HR",
@@ -1223,7 +1552,7 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Outlaw HR Scanner V4 — last 10 games")
+    parser = argparse.ArgumentParser(description="Outlaw HR Scanner V5.1 — last 10 games + BvP")
     parser.add_argument("--date", default=str(date.today()), help="YYYY-MM-DD")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--lookback-days", type=int, default=32)
