@@ -14,7 +14,7 @@ OUTPUT_DIR = APP_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 st.set_page_config(
-    page_title="Outlaw HR Scanner V5.1",
+    page_title="Outlaw HR Scanner V5.2",
     page_icon="💣",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -32,10 +32,10 @@ div[data-testid="stMetric"] {border: 1px solid rgba(128,128,128,.25); padding: .
 </style>
 """, unsafe_allow_html=True)
 
-st.title("💣 Outlaw HR Scanner V5.1")
+st.title("💣 Outlaw HR Scanner V5.2")
 st.caption(
-    "Last 10 games | 50% recent power | 25% pitcher leak | "
-    "15% due | 10% environment | regressed historical BvP"
+    "Last 10 games: 35% recent form | 35% pitcher matchup | "
+    "25% near-HR | 5% park/weather | career BvP display-only"
 )
 st.caption("* = platoon advantage | ** = switch hitter | ⚠ = small pitcher sample")
 
@@ -44,7 +44,7 @@ scan_date = st.date_input("Slate date", value=date.today())
 if "error" not in st.session_state:
     st.session_state.error = ""
 
-if st.button("Run V5.1 Scan", type="primary", use_container_width=True):
+if st.button("Run V5.2 Scan", type="primary", use_container_width=True):
     st.session_state.error = ""
     cmd = [
         sys.executable, str(APP_DIR / "scanner.py"),
@@ -60,10 +60,10 @@ if st.button("Run V5.1 Scan", type="primary", use_container_width=True):
         "NUMEXPR_NUM_THREADS": "1",
         "PYTHONUNBUFFERED": "1",
     })
-    with st.status("Running V5.1 scanner...", expanded=True) as status:
+    with st.status("Running V5.2 scanner...", expanded=True) as status:
         st.write("Downloading recent Statcast data...")
         st.write("Building last-10 hitter profiles...")
-        st.write("Validating active rosters and calculating BvP, pitcher leak, due, and environment...")
+        st.write("Validating active rosters and calculating recent form, pitcher matchup, near-HR, environment, and display-only BvP...")
         try:
             p = subprocess.run(
                 cmd, cwd=APP_DIR, env=env, capture_output=True,
@@ -99,7 +99,8 @@ if csv_path.exists():
         "Player_Display", "HR_Likelihood", "Best_Look", "Conviction",
         "Hot_Symbol", "Due_Meter", "opposing_pitcher",
         "Pitcher_Sample_Flag", "BvP_Sample_Flag", "Power_Index",
-        "Recent_Power", "Pitcher_Leak", "BvP_Score", "BvP_Adjustment",
+        "Recent_Power", "Pitcher_Matchup_Score", "Pitcher_Leak",
+        "Near_HR_Score", "BvP_Score",
         "BvP_PA", "BvP_HR", "TANKS", "Porch_Shots", "team", "opponent",
     ]
     core_cols = [c for c in core_cols if c in board.columns]
@@ -153,11 +154,13 @@ if csv_path.exists():
             "Overall_Rank", "Game_Rank", "Player_Display", "HR_Likelihood",
             "Best_Look", "Conviction", "Due_Meter", "opposing_pitcher",
             "Pitcher_Sample_Flag", "Power_Index", "Recent_Power",
-            "Pitcher_Leak", "BvP_Score", "BvP_Adjustment", "BvP_PA",
+            "Pitcher_Matchup_Score", "Pitcher_Leak", "Near_HR_Score",
+            "BvP_Score", "BvP_PA",
             "BvP_HR", "BvP_AVG", "BvP_SLG", "BvP_Sample_Flag",
             "Due_Score_V4", "Environment", "TANKS",
             "Porch_Shots", "HR", "Barrels_approx", "EV_100_plus",
-            "EV_100_plus_outs", "Fly_375_plus", "Out_380_400",
+            "EV_100_plus_outs", "Fly_350_plus_outs",
+            "Fly_375_plus_outs", "Out_380_400",
             "Near_HR", "xHR_minus_HR", "PullAir_pct", "Pitcher_HR_pct",
             "Pitcher_Barrel_pct_approx", "Park_Factor", "Weather_Impact",
         ]
@@ -178,4 +181,4 @@ if csv_path.exists():
                 use_container_width=True
             )
 else:
-    st.info("Choose the slate date and tap **Run V4 Scan**.")
+    st.info("Choose the slate date and tap **Run V5.2 Scan**.")

@@ -55,29 +55,13 @@ PARK_FACTORS = {
 }
 
 DEFAULT_WEIGHTS = {
-    "contact_quality": 0.30,
-    "pitcher_vulnerability": 0.25,
-    "pitch_mix_matchup": 0.15,
-    "park_environment": 0.15,
-    "regression_due": 0.10,
-    "market_value": 0.05,
+    "contact_quality": 0.35,
+    "pitcher_vulnerability": 0.35,
+    "pitch_mix_matchup": 0.00,  # folded into pitcher vulnerability
+    "park_environment": 0.05,
+    "regression_due": 0.25,
+    "market_value": 0.00,
 }
-
-# These are used only to validate roster eligibility. Confirmed batting orders
-# always take precedence because a player listed in the official lineup is
-# eligible for that game.
-INACTIVE_TRANSACTION_TERMS = (
-    "optioned", "reassigned", "injured list", "disabled list",
-    "designated for assignment", "released", "suspended",
-    "restricted list", "bereavement list", "paternity list",
-    "family medical emergency list", "outrighted", "transferred to the 60-day",
-    "placed on the 10-day", "placed on the 15-day", "placed on the 60-day",
-)
-ACTIVE_TRANSACTION_TERMS = (
-    "recalled", "activated", "reinstated", "selected the contract",
-    "contract selected", "purchased the contract", "returned from",
-    "added to the active roster",
-)
 
 
 @dataclass
@@ -139,245 +123,48 @@ def schedule_for_date(game_date: str) -> list[GameContext]:
     return games
 
 
-def game_lineups_and_rosters(
-    game_pk: int,
-) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
-    """Return confirmed lineups and game-level eligible hitter rosters.
-
-    The live boxscore frequently exposes the game roster before the batting
-    order is posted. That roster is preferred over the broader team endpoint
-    because it reflects eligibility for the selected game.
-    """
+def confirmed_lineup(game_pk: int) -> tuple[list[dict], list[dict]]:
+    """Returns away, home lineups. Empty lists mean not yet posted."""
     payload = get_json(LIVE_FEED.format(game_pk=game_pk))
     box = payload.get("liveData", {}).get("boxscore", {}).get("teams", {})
-    lineups: list[list[dict]] = []
-    rosters: list[list[dict]] = []
-
+    result = []
     for side in ("away", "home"):
-        team_box = box.get(side, {}) or {}
-        order = [int(pid) for pid in (team_box.get("battingOrder") or [])]
+        team_box = box.get(side, {})
+        order = team_box.get("battingOrder") or []
         players = team_box.get("players") or {}
-        by_id: dict[int, dict] = {}
-
-        for player_data in players.values():
-            person = player_data.get("person") or {}
-            pid = person.get("id")
-            if pid is None:
-                continue
-            pid = int(pid)
-            position = player_data.get("position") or {}
-            position_type = str(position.get("type", ""))
-            status = player_data.get("status") or {}
-            status_text = " ".join(
-                str(status.get(key, "")) for key in ("code", "description")
-            ).lower()
-
-            # Never discard an official batting-order player. Otherwise remove
-            # explicit inactive statuses and pitcher-only entries.
-            if pid not in order:
-                if any(term in status_text for term in (
-                    "injured", "disabled", "inactive", "suspended",
-                    "restricted", "minors", "optioned",
-                )):
-                    continue
-                if position_type == "Pitcher":
-                    continue
-
-            by_id[pid] = {
-                "player_id": pid,
-                "player": person.get("fullName", str(pid)),
-                "lineup_spot": np.nan,
-                "position": position.get("abbreviation"),
-                "roster_source": "game_boxscore",
-            }
-
-        lineup: list[dict] = []
+        lineup = []
         for slot, pid in enumerate(order, start=1):
-            row = by_id.get(pid)
-            if row is None:
-                player_data = players.get(f"ID{pid}", {}) or {}
-                person = player_data.get("person") or {}
-                position = player_data.get("position") or {}
-                row = {
-                    "player_id": pid,
-                    "player": person.get("fullName", str(pid)),
-                    "lineup_spot": slot,
-                    "position": position.get("abbreviation"),
-                    "roster_source": "confirmed_lineup",
-                }
-            else:
-                row = dict(row)
-                row["lineup_spot"] = slot
-                row["roster_source"] = "confirmed_lineup"
-            lineup.append(row)
-
-        lineups.append(lineup)
-        rosters.append(list(by_id.values()))
-
-    return lineups[0], lineups[1], rosters[0], rosters[1]
-
-
-def confirmed_lineup(game_pk: int) -> tuple[list[dict], list[dict]]:
-    """Compatibility wrapper returning only the posted batting orders."""
-    away, home, _, _ = game_lineups_and_rosters(game_pk)
-    return away, home
-
-
-def _entry_status_is_active(entry: dict) -> bool:
-    status = entry.get("status") or {}
-    text = " ".join(
-        str(status.get(key, "")) for key in ("code", "description")
-    ).lower()
-    if not text.strip():
-        return True
-    return not any(term in text for term in (
-        "injured", "disabled", "inactive", "suspended", "restricted",
-        "minors", "optioned", "designated", "released",
-    ))
-
-
-def _people_current_team(person_ids: list[int]) -> dict[int, dict[str, Any]]:
-    """Bulk player metadata used to catch optioned/minor-league players."""
-    ids = sorted({int(pid) for pid in person_ids})
-    if not ids:
-        return {}
-    try:
-        payload = get_json(
-            f"{MLB_STATS}/people",
-            {
-                "personIds": ",".join(str(pid) for pid in ids),
-                "hydrate": "currentTeam",
-            },
-        )
-    except Exception:
-        return {}
-
-    result: dict[int, dict[str, Any]] = {}
-    for person in payload.get("people", []) or []:
-        pid = person.get("id")
-        if pid is None:
-            continue
-        current_team = person.get("currentTeam") or {}
-        result[int(pid)] = {
-            "active": person.get("active"),
-            "current_team_id": current_team.get("id"),
-        }
-    return result
-
-
-def _recent_transaction_states(
-    team_id: int,
-    game_date: str,
-    person_ids: list[int],
-    lookback_days: int = 90,
-) -> dict[int, bool]:
-    """Return latest known active/inactive state from MLB transactions.
-
-    True means a recent activation/recall; False means a recent option, IL,
-    DFA, release, suspension, or other inactive transaction. Unknown players
-    are omitted so API gaps do not incorrectly remove them.
-    """
-    ids = {int(pid) for pid in person_ids}
-    if not ids:
-        return {}
-    end_date = pd.Timestamp(game_date).date()
-    start_date = end_date - timedelta(days=lookback_days)
-    try:
-        payload = get_json(
-            f"{MLB_STATS}/transactions",
-            {
-                "teamId": int(team_id),
-                "startDate": start_date.isoformat(),
-                "endDate": end_date.isoformat(),
-                "sportId": 1,
-            },
-        )
-    except Exception:
-        return {}
-
-    latest: dict[int, tuple[pd.Timestamp, bool]] = {}
-    for tx in payload.get("transactions", []) or []:
-        person = tx.get("person") or {}
-        pid = person.get("id")
-        if pid is None or int(pid) not in ids:
-            continue
-        text = " ".join(
-            str(tx.get(key, ""))
-            for key in ("typeCode", "typeDesc", "description")
-        ).lower()
-
-        state: bool | None = None
-        if any(term in text for term in ACTIVE_TRANSACTION_TERMS):
-            state = True
-        elif any(term in text for term in INACTIVE_TRANSACTION_TERMS):
-            state = False
-        if state is None:
-            continue
-
-        tx_date = pd.to_datetime(
-            tx.get("effectiveDate") or tx.get("date"), errors="coerce"
-        )
-        if pd.isna(tx_date):
-            tx_date = pd.Timestamp.min
-        current = latest.get(int(pid))
-        if current is None or tx_date >= current[0]:
-            latest[int(pid)] = (tx_date, state)
-
-    return {pid: state for pid, (_, state) in latest.items()}
+            key = f"ID{pid}"
+            p = players.get(key, {})
+            person = p.get("person", {})
+            position = p.get("position", {}).get("abbreviation")
+            lineup.append({
+                "player_id": int(pid),
+                "player": person.get("fullName", str(pid)),
+                "lineup_spot": slot,
+                "position": position,
+            })
+        result.append(lineup)
+    return result[0], result[1]
 
 
 def fallback_roster(team_id: int, game_date: str) -> list[dict]:
-    """Validated active MLB hitter roster for games without a posted lineup."""
     payload = get_json(
         f"{MLB_STATS}/teams/{team_id}/roster",
+        {"rosterType": "active", "date": game_date},
+    )
+    return [
         {
-            "rosterType": "active",
-            "date": game_date,
-            "hydrate": "person(currentTeam)",
-        },
-    )
-    entries = [
-        x for x in (payload.get("roster", []) or [])
-        if x.get("position", {}).get("type") != "Pitcher"
-        and _entry_status_is_active(x)
-    ]
-    if not entries:
-        return []
-
-    person_ids = [int(x["person"]["id"]) for x in entries]
-
-    # Current-team and transaction checks are appropriate for a live slate.
-    # Historical backtests continue to rely on the date-specific roster API.
-    selected_date = date.fromisoformat(game_date)
-    near_current = abs((selected_date - date.today()).days) <= 2
-    people = _people_current_team(person_ids) if near_current else {}
-    transactions = (
-        _recent_transaction_states(team_id, game_date, person_ids)
-        if near_current else {}
-    )
-
-    roster: list[dict] = []
-    for entry in entries:
-        pid = int(entry["person"]["id"])
-        meta = people.get(pid, {})
-        current_team_id = meta.get("current_team_id")
-        explicitly_active = meta.get("active")
-
-        if explicitly_active is False:
-            continue
-        if current_team_id is not None and int(current_team_id) != int(team_id):
-            continue
-        if transactions.get(pid) is False:
-            continue
-
-        roster.append({
-            "player_id": pid,
-            "player": entry["person"].get("fullName", str(pid)),
+            "player_id": int(x["person"]["id"]),
+            "player": x["person"]["fullName"],
             "lineup_spot": np.nan,
-            "position": entry.get("position", {}).get("abbreviation"),
-            "roster_source": "validated_active_roster",
-        })
-    return roster
+            "position": x.get("position", {}).get("abbreviation"),
+        }
+        for x in payload.get("roster", [])
+        if x.get("position", {}).get("type") != "Pitcher"
+        and str((x.get("status") or {}).get("code", "A")).upper() == "A"
+    ]
+
 
 def team_id_map() -> dict[str, int]:
     payload = get_json(f"{MLB_STATS}/teams", {"sportId": 1})
@@ -386,15 +173,15 @@ def team_id_map() -> dict[str, int]:
         for x in payload.get("teams", [])
     }
 
-
 def historical_bvp_for_pitcher(
     batter_ids: list[int],
     pitcher_id: int | None,
 ) -> dict[int, dict[str, float]]:
-    """Fetch career batter-vs-pitcher totals in one request per starter.
+    """Fetch career batter-vs-pitcher totals for a group of hitters.
 
-    BvP is retained as a small, sample-regressed adjustment. It supplements,
-    rather than replaces, the last-10-game Statcast profile.
+    MLB StatsAPI's ``vsPlayer`` split is requested in one call per opposing
+    pitcher. Small samples are retained for display but regressed heavily in
+    the score, so a 2-for-4 history cannot overwhelm the 10-game Statcast form.
     """
     if not pitcher_id or not batter_ids:
         return {}
@@ -402,9 +189,7 @@ def historical_bvp_for_pitcher(
         payload = get_json(
             f"{MLB_STATS}/people",
             {
-                "personIds": ",".join(
-                    str(int(pid)) for pid in sorted(set(batter_ids))
-                ),
+                "personIds": ",".join(str(int(pid)) for pid in sorted(set(batter_ids))),
                 "hydrate": (
                     "stats(group=[hitting],type=[vsPlayer],"
                     f"opposingPlayerId={int(pitcher_id)},sportId=1)"
@@ -415,36 +200,24 @@ def historical_bvp_for_pitcher(
         return {}
 
     result: dict[int, dict[str, float]] = {}
-    for person in payload.get("people", []) or []:
+    for person in payload.get("people", []):
         pid = person.get("id")
         if pid is None:
             continue
-
-        candidates: list[dict[str, Any]] = []
+        stat: dict[str, Any] = {}
         for block in person.get("stats", []) or []:
-            for split in block.get("splits", []) or []:
-                stat = split.get("stat") or {}
-                if stat:
-                    candidates.append(stat)
-
-        # The hydration can expose season and total splits. The largest PA
-        # sample is the career matchup and is the appropriate historical input.
-        def number(value: Any) -> float:
-            parsed = pd.to_numeric(value, errors="coerce")
-            return 0.0 if pd.isna(parsed) else float(parsed)
-
-        def pa_value(stat: dict[str, Any]) -> float:
-            return number(stat.get("plateAppearances"))
-
-        stat = max(candidates, key=pa_value) if candidates else {}
-        pa = number(stat.get("plateAppearances"))
-        ab = number(stat.get("atBats"))
-        hits = number(stat.get("hits"))
-        hr = number(stat.get("homeRuns"))
-        doubles = number(stat.get("doubles"))
-        triples = number(stat.get("triples"))
-        walks = number(stat.get("baseOnBalls"))
-        hbp = number(stat.get("hitByPitch"))
+            splits = block.get("splits") or []
+            if splits:
+                stat = splits[0].get("stat") or {}
+                break
+        pa = float(stat.get("plateAppearances") or 0)
+        ab = float(stat.get("atBats") or 0)
+        hits = float(stat.get("hits") or 0)
+        hr = float(stat.get("homeRuns") or 0)
+        doubles = float(stat.get("doubles") or 0)
+        triples = float(stat.get("triples") or 0)
+        walks = float(stat.get("baseOnBalls") or 0)
+        hbp = float(stat.get("hitByPitch") or 0)
         total_bases = hits + doubles + 2 * triples + 3 * hr
         avg = hits / ab if ab else np.nan
         slg = total_bases / ab if ab else np.nan
@@ -661,7 +434,8 @@ def batted_ball_metrics(p: pd.DataFrame) -> dict[str, float]:
             "BBE", "Avg_EV", "EV90", "Max_EV", "HH_95", "HH_pct",
             "EV_100_plus", "EV_100_plus_outs", "Barrels_approx", "Barrel_pct_approx",
             "Avg_LA", "SweetSpot", "SweetSpot_pct", "PullAir", "PullAir_pct",
-            "Fly_350_plus", "Fly_375_plus", "Out_380_400", "Near_HR",
+            "Fly_350_plus", "Fly_375_plus", "Fly_350_plus_outs",
+            "Fly_375_plus_outs", "Out_380_400", "Near_HR",
             "xHR_proxy", "xHR_minus_HR"
         ]}
     b["launch_speed"] = pd.to_numeric(b["launch_speed"], errors="coerce")
@@ -685,6 +459,8 @@ def batted_ball_metrics(p: pd.DataFrame) -> dict[str, float]:
     pull_air = air & pull
     fly_350 = (b["launch_angle"] >= 15) & (b["hit_distance_sc"] >= 350)
     fly_375 = (b["launch_angle"] >= 15) & (b["hit_distance_sc"] >= 375)
+    fly_350_outs = b["is_out"] & fly_350
+    fly_375_outs = b["is_out"] & fly_375
     out_380_400 = b["is_out"] & b["hit_distance_sc"].between(380, 400, inclusive="both")
     near_hr = (
         (b["is_out"] & (b["hit_distance_sc"] >= 375))
@@ -709,6 +485,8 @@ def batted_ball_metrics(p: pd.DataFrame) -> dict[str, float]:
         "PullAir_pct": float(pull_air.mean()),
         "Fly_350_plus": int(fly_350.sum()),
         "Fly_375_plus": int(fly_375.sum()),
+        "Fly_350_plus_outs": int(fly_350_outs.sum()),
+        "Fly_375_plus_outs": int(fly_375_outs.sum()),
         "Out_380_400": int(out_380_400.sum()),
         "Near_HR": int(near_hr.sum()),
         "xHR_proxy": float(b["xhr_proxy"].sum()),
@@ -781,24 +559,23 @@ def normalize_series(s: pd.Series, low: float = 0, high: float = 100) -> pd.Seri
 
 
 def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
+    """Legacy-compatible scorer using the current 35/35/25/5 macro structure."""
     out = df.copy()
     contact_raw = (
-        out["Avg_EV"].fillna(out["Avg_EV"].median()) * 0.18
-        + out["EV90"].fillna(out["EV90"].median()) * 0.16
+        out["Avg_EV"].fillna(out["Avg_EV"].median()) * 0.10
+        + out["EV90"].fillna(out["EV90"].median()) * 0.15
         + out["Max_EV"].fillna(out["Max_EV"].median()) * 0.10
-        + out["HH_pct"].fillna(0) * 100 * 0.16
-        + out["Barrel_pct_approx"].fillna(0) * 100 * 0.16
-        + out["PullAir_pct"].fillna(0) * 100 * 0.10
-        + out["Fly_375_plus"].fillna(0) * 3.5
-        + out["Near_HR"].fillna(0) * 2.5
+        + out["HH_pct"].fillna(0) * 100 * 0.20
+        + out["Barrel_pct_approx"].fillna(0) * 100 * 0.25
+        + out["PullAir_pct"].fillna(0) * 100 * 0.20
     )
     pitcher_raw = (
         out["Pitcher_HR_pct"].fillna(0) * 100 * 0.35
-        + out["Pitcher_HH_pct"].fillna(0) * 100 * 0.30
+        + out["Pitcher_HH_pct"].fillna(0) * 100 * 0.25
         + out["Pitcher_Barrel_pct_approx"].fillna(0) * 100 * 0.25
-        + out["Pitcher_Avg_EV"].fillna(85) * 0.10
+        + out["Pitcher_Avg_EV"].fillna(85) * 0.15
     )
-    due_raw = (
+    near_hr_raw = (
         out["xHR_minus_HR"].fillna(0) * 20
         + out["EV_100_plus_outs"].fillna(0) * 3
         + out["Out_380_400"].fillna(0) * 5
@@ -806,17 +583,18 @@ def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFram
     out["Contact_Score"] = normalize_series(contact_raw)
     out["Pitcher_Vuln_Score"] = normalize_series(pitcher_raw)
     out["Pitch_Mix_Score"] = out["Pitch_Mix_Score"].fillna(50).clip(0, 100)
+    out["Pitcher_Matchup_Score"] = (
+        out["Pitcher_Vuln_Score"] * 0.75 + out["Pitch_Mix_Score"] * 0.25
+    ).clip(0, 100)
     out["Park_Env_Score"] = normalize_series(out["Park_Factor"] * out["Weather_Factor"])
-    out["Due_Score"] = normalize_series(due_raw)
+    out["Due_Score"] = normalize_series(near_hr_raw)
     out["Market_Value_Score"] = out["Market_Value_Score"].fillna(50).clip(0, 100)
 
     out["Model_Score"] = (
-        out["Contact_Score"] * weights["contact_quality"]
-        + out["Pitcher_Vuln_Score"] * weights["pitcher_vulnerability"]
-        + out["Pitch_Mix_Score"] * weights["pitch_mix_matchup"]
-        + out["Park_Env_Score"] * weights["park_environment"]
-        + out["Due_Score"] * weights["regression_due"]
-        + out["Market_Value_Score"] * weights["market_value"]
+        out["Contact_Score"] * 0.35
+        + out["Pitcher_Matchup_Score"] * 0.35
+        + out["Due_Score"] * 0.25
+        + out["Park_Env_Score"] * 0.05
     )
     out["Qualifying_Power_Signals"] = (
         (out["Barrels_approx"].fillna(0) >= 2).astype(int)
@@ -843,12 +621,15 @@ def _fixed_scale(series: pd.Series, low: float, high: float) -> pd.Series:
 
 def add_v4_scores(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Transparent V4 engine:
-      50% recent power (last 10 games)
-      25% pitcher leak by batter side
-      15% due indicators
-      10% environment
-      plus a sample-regressed historical BvP adjustment capped at +/-5 points
+    Transparent scanner engine using the user-approved macro weighting:
+      35% last-10-game contact/power form
+      35% opposing-pitcher vulnerability, including pitch-mix compatibility
+      25% last-10-game near-home-run/regression indicators
+       5% park and weather environment
+       0% career batter-vs-pitcher history (display only)
+
+    Confirmed lineup status is not required. A listed opposing pitcher is required
+    upstream. BvP statistics remain visible but never alter Power_Index.
     """
     out = df.copy()
 
@@ -857,35 +638,37 @@ def add_v4_scores(df: pd.DataFrame) -> pd.DataFrame:
             return pd.Series(default, index=out.index, dtype="float64")
         return pd.to_numeric(out[col], errors="coerce").fillna(default)
 
-    # Recent power profile.
+    # ------------------------------------------------------------------
+    # 35%: Last-10-game contact/power form.
+    # Deep outs and xHR regression are deliberately excluded here so they
+    # are not double-counted with the separate 25% near-HR component.
+    # ------------------------------------------------------------------
     recent_hr = n("HR")
     barrels = n("Barrels_approx")
     ev100 = n("EV_100_plus")
-    deep375 = n("Fly_375_plus")
-    deep400 = n("Out_380_400")
     hh = n("HH_pct")
     pull_air = n("PullAir_pct")
     sweet = n("SweetSpot_pct")
+    avg_ev = n("Avg_EV", 88.0)
     ev90 = n("EV90", 95.0)
     max_ev = n("Max_EV", 95.0)
 
     out["Recent_Power"] = (
-        _fixed_scale(recent_hr, 0, 5) * 0.18
+        _fixed_scale(recent_hr, 0, 5) * 0.10
         + _fixed_scale(barrels, 0, 7) * 0.20
         + _fixed_scale(ev100, 1, 16) * 0.14
-        + _fixed_scale(deep375, 0, 7) * 0.12
-        + _fixed_scale(deep400, 0, 4) * 0.05
-        + _fixed_scale(hh, 0.25, 0.65) * 0.10
-        + _fixed_scale(pull_air, 0.08, 0.38) * 0.09
-        + _fixed_scale(sweet, 0.18, 0.48) * 0.05
-        + _fixed_scale(ev90, 96, 111) * 0.04
-        + _fixed_scale(max_ev, 101, 116) * 0.03
+        + _fixed_scale(hh, 0.25, 0.65) * 0.14
+        + _fixed_scale(pull_air, 0.08, 0.38) * 0.14
+        + _fixed_scale(sweet, 0.18, 0.48) * 0.08
+        + _fixed_scale(avg_ev, 84, 96) * 0.06
+        + _fixed_scale(ev90, 96, 111) * 0.08
+        + _fixed_scale(max_ev, 101, 116) * 0.06
     ).clip(0, 100)
 
-    # HR-quality contact indicators inspired by the uploaded cheat sheet.
-    launch_angle = n("Avg_LA")
+    # HR-quality display indicators.
+    deep375 = n("Fly_375_plus")
     out["TANKS"] = (
-        (barrels * 0.60 + n("EV_100_plus") * 0.25 + deep375 * 0.15)
+        (barrels * 0.60 + ev100 * 0.25 + deep375 * 0.15)
         .round()
         .astype(int)
     )
@@ -895,7 +678,11 @@ def add_v4_scores(df: pd.DataFrame) -> pd.DataFrame:
         .astype(int)
     )
 
-    # Pitcher leak with strong sample regression.
+    # ------------------------------------------------------------------
+    # 35%: Pitcher vulnerability by projected batter side.
+    # Pitch-type compatibility is nested inside this category rather than
+    # receiving a separate macro weight.
+    # ------------------------------------------------------------------
     p_bbe = n("Pitcher_BBE")
     p_hr = n("Pitcher_HR_pct")
     p_barrel = n("Pitcher_Barrel_pct_approx")
@@ -910,23 +697,39 @@ def add_v4_scores(df: pd.DataFrame) -> pd.DataFrame:
         + _fixed_scale(p_ev, 84, 93) * 0.15
     )
     out["Pitcher_Leak"] = (50 + (raw_pitcher - 50) * reliability).clip(0, 100)
+    out["Pitch_Mix_Score"] = n("Pitch_Mix_Score", 50.0).clip(0, 100)
+    out["Pitcher_Matchup_Score"] = (
+        out["Pitcher_Leak"] * 0.75 + out["Pitch_Mix_Score"] * 0.25
+    ).clip(0, 100)
     out["Pitcher_Sample"] = p_bbe.astype(int)
     out["Pitcher_Sample_Flag"] = ""
     out.loc[p_bbe < 25, "Pitcher_Sample_Flag"] = "⚠ SMALL SAMPLE"
 
-    # Due meter.
+    # ------------------------------------------------------------------
+    # 25%: Near-home-run / regression signals from the same last 10 games.
+    # These are isolated from Recent_Power to prevent double-counting.
+    # ------------------------------------------------------------------
+    fly350_outs = n("Fly_350_plus_outs")
+    fly375_outs = n("Fly_375_plus_outs")
     due_raw = (
-        _fixed_scale(n("EV_100_plus_outs"), 0, 8) * 0.30
-        + _fixed_scale(n("Out_380_400"), 0, 4) * 0.25
-        + _fixed_scale(n("Near_HR"), 0, 5) * 0.25
+        _fixed_scale(n("EV_100_plus_outs"), 0, 8) * 0.25
+        + _fixed_scale(fly350_outs, 0, 6) * 0.15
+        + _fixed_scale(fly375_outs, 0, 4) * 0.20
+        + _fixed_scale(n("Out_380_400"), 0, 4) * 0.20
         + _fixed_scale(n("xHR_minus_HR"), 0, 2.5) * 0.20
     )
-    out["Due_Score_V4"] = due_raw.clip(0, 100)
+    out["Near_HR_Score"] = due_raw.clip(0, 100)
+    # Backward-compatible alias used by the existing Streamlit tabs/export.
+    out["Due_Score_V4"] = out["Near_HR_Score"]
     out["Due_Meter"] = "🟡 NEUTRAL"
     out.loc[(due_raw >= 65) & (recent_hr <= 2), "Due_Meter"] = "🟢 DUE"
-    out.loc[(recent_hr >= 3), "Due_Meter"] = "🔥 PRODUCING"
+    out.loc[recent_hr >= 3, "Due_Meter"] = "🔥 PRODUCING"
 
-    # Environment capped so it cannot dominate.
+    # ------------------------------------------------------------------
+    # 5%: Combined park and weather.
+    # Internal split: 70% park / 30% weather, equal to 3.5% and 1.5% of
+    # the full model. This category is intentionally capped at 5% total.
+    # ------------------------------------------------------------------
     park = n("Park_Factor", 1.0)
     weather = n("Weather_Factor", 1.0)
     out["Environment"] = (
@@ -934,50 +737,48 @@ def add_v4_scores(df: pd.DataFrame) -> pd.DataFrame:
         + _fixed_scale(weather, 0.94, 1.06) * 0.30
     ).clip(0, 100)
 
-    # Historical BvP. Small samples are strongly regressed to neutral.
+    # Career BvP remains available for reference only (0% model weight).
     bvp_pa = n("BvP_PA")
     bvp_hr = n("BvP_HR")
     bvp_avg = n("BvP_AVG", 0.250)
     bvp_slg = n("BvP_SLG", 0.400)
-    bvp_hr_rate = (bvp_hr / bvp_pa.replace(0, np.nan)).fillna(0)
     bvp_raw = (
-        _fixed_scale(bvp_hr_rate, 0.00, 0.12) * 0.40
+        _fixed_scale(bvp_hr, 0, 5) * 0.40
         + _fixed_scale(bvp_slg, 0.250, 0.850) * 0.35
         + _fixed_scale(bvp_avg, 0.150, 0.400) * 0.25
     )
-    bvp_reliability = (bvp_pa / 30.0).clip(0, 1)
+    bvp_reliability = (bvp_pa / 25.0).clip(0, 1)
     out["BvP_Score"] = (50 + (bvp_raw - 50) * bvp_reliability).clip(0, 100)
-    out["BvP_Adjustment"] = ((out["BvP_Score"] - 50) * 0.10).clip(-5, 5)
+    out["BvP_Model_Weight"] = 0.0
+    out["BvP_Model_Contribution"] = 0.0
     out["BvP_Sample_Flag"] = ""
-    out.loc[bvp_pa == 0, "BvP_Sample_Flag"] = "NO HISTORY"
     out.loc[(bvp_pa > 0) & (bvp_pa < 10), "BvP_Sample_Flag"] = "⚠ SMALL BvP"
+    out.loc[bvp_pa == 0, "BvP_Sample_Flag"] = "NO HISTORY"
 
-    # Preserve the original V4 weighting and apply BvP only as a bounded overlay.
-    out["Base_Power_Index"] = (
-        out["Recent_Power"] * 0.50
-        + out["Pitcher_Leak"] * 0.25
-        + out["Due_Score_V4"] * 0.15
-        + out["Environment"] * 0.10
+    # Exact macro weighting: 35 / 35 / 25 / 5. BvP contributes zero.
+    out["Power_Index"] = (
+        out["Recent_Power"] * 0.35
+        + out["Pitcher_Matchup_Score"] * 0.35
+        + out["Near_HR_Score"] * 0.25
+        + out["Environment"] * 0.05
     ).clip(0, 100)
-    out["Power_Index"] = (out["Base_Power_Index"] + out["BvP_Adjustment"]).clip(0, 100)
 
-    # Recalibrated display-only estimate: roughly 4%-30%, with a 58 index
-    # near 24%. This changes the display scale, not the underlying rankings.
-    likelihood = 0.035 + 0.265 / (1 + np.exp(-(out["Power_Index"] - 47.0) / 9.0))
+    # Bounded display estimate; rankings are controlled by Power_Index.
+    likelihood = 0.035 + 0.255 / (1 + np.exp(-(out["Power_Index"] - 66) / 8.5))
     out["HR_Likelihood_pct"] = (likelihood * 100).round().astype(int)
     out["HR_Likelihood"] = out["HR_Likelihood_pct"].astype(str) + "%"
 
-    # Conviction and best market.
+    # Existing labels retained for backward compatibility.
     out["Conviction"] = "HR LEAN"
     out.loc[out["Power_Index"] >= 62, "Conviction"] = "🔥 SOLID"
     out.loc[out["Power_Index"] >= 72, "Conviction"] = "🔥🔥 FIRED"
-    out.loc[(out["Due_Score_V4"] >= 70) & (out["Power_Index"] < 72), "Conviction"] = "🎯 DUE"
+    out.loc[(out["Near_HR_Score"] >= 70) & (out["Power_Index"] < 72), "Conviction"] = "🎯 DUE"
 
     out["Best_Look"] = "HR LEAN"
     out.loc[(out["Power_Index"] >= 68) & (out["Recent_Power"] >= 65), "Best_Look"] = "HR"
-    out.loc[(out["Due_Score_V4"] >= 70) & (out["Recent_Power"] >= 50), "Best_Look"] = "LONGSHOT HR"
+    out.loc[(out["Near_HR_Score"] >= 70) & (out["Recent_Power"] >= 50), "Best_Look"] = "LONGSHOT HR"
     out.loc[(pull_air < 0.12) & (n("AVG") >= 0.275), "Best_Look"] = "2+ TB / HRR"
-    out.loc[(out["Recent_Power"] < 35) & (out["Pitcher_Leak"] < 45), "Best_Look"] = "SKIP HR"
+    out.loc[(out["Recent_Power"] < 35) & (out["Pitcher_Matchup_Score"] < 45), "Best_Look"] = "SKIP HR"
 
     # Player display + platoon.
     batter_side = out.get("batter_profile_side", pd.Series("U", index=out.index)).fillna("U").astype(str).str.upper()
@@ -995,7 +796,7 @@ def add_v4_scores(df: pd.DataFrame) -> pd.DataFrame:
 
     # Rank overall and within each game.
     out = out.sort_values(
-        ["Power_Index", "Recent_Power", "Pitcher_Leak"],
+        ["Power_Index", "Recent_Power", "Pitcher_Matchup_Score"],
         ascending=[False, False, False],
     ).reset_index(drop=True)
     out["Overall_Rank"] = np.arange(1, len(out) + 1)
@@ -1341,7 +1142,7 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
 
     # Preserve the original pitcher matchup window at 32 calendar days.
     # The wider source download is used to reconstruct each hitter's
-    # 10 most recent games.
+    # 10 most recent games while preserving a 32-day pitcher window.
     pitcher_start = pd.Timestamp(game_date) - pd.Timedelta(days=32)
     season_sc = sc[sc["game_date"] >= pitcher_start].copy()
 
@@ -1355,19 +1156,16 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
     rows = []
     for game in games:
         try:
-            away_lineup, home_lineup, away_game_roster, home_game_roster = (
-                game_lineups_and_rosters(game.game_pk)
-            )
+            away_lineup, home_lineup = confirmed_lineup(game.game_pk)
         except Exception:
             away_lineup, home_lineup = [], []
-            away_game_roster, home_game_roster = [], []
 
-        # Confirmed lineups remain optional. When unavailable, prefer the
-        # game-level roster; only then use the validated team active roster.
+        # Lineup confirmation is reference-only. Always scan the active roster
+        # when a batting order is unavailable.
         if not away_lineup:
-            away_lineup = away_game_roster or fallback_roster(ids[game.away], game_date)
+            away_lineup = fallback_roster(ids[game.away], game_date)
         if not home_lineup:
-            home_lineup = home_game_roster or fallback_roster(ids[game.home], game_date)
+            home_lineup = fallback_roster(ids[game.home], game_date)
 
         game_person_ids = [
             *(p.get("player_id") for p in away_lineup),
@@ -1453,7 +1251,6 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
                     "player": hitter["player"],
                     "lineup_spot": hitter["lineup_spot"],
                     "position": hitter["position"],
-                    "roster_source": hitter.get("roster_source", "unknown"),
                     "bat_side": stand,
                     "batter_profile_side": listed_bat_side,
                     "pitcher_throws": pitcher_throws,
@@ -1500,15 +1297,17 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         "Overall_Rank", "Game_Rank", "Player_Display", "HR_Likelihood",
         "Best_Look", "Conviction", "Hot_Symbol", "Due_Meter",
         "opposing_pitcher", "Pitcher_Sample_Flag", "Pitcher_Sample",
-        "Power_Index", "Base_Power_Index", "Recent_Power", "Pitcher_Leak",
-        "BvP_Score", "BvP_Adjustment", "BvP_PA", "BvP_AB", "BvP_H",
-        "BvP_HR", "BvP_AVG", "BvP_OBP", "BvP_SLG", "BvP_Sample_Flag",
-        "Due_Score_V4", "Environment", "TANKS", "Porch_Shots",
-        "Top_10_Overall", "Top_4_Per_Game", "team", "opponent", "venue",
-        "lineup_spot", "roster_source",
+        "Power_Index", "Recent_Power", "Pitcher_Leak",
+        "Pitcher_Matchup_Score", "Near_HR_Score", "BvP_Score",
+        "BvP_PA", "BvP_AB", "BvP_H", "BvP_HR", "BvP_AVG", "BvP_OBP",
+        "BvP_SLG", "BvP_Sample_Flag", "BvP_Model_Weight",
+        "BvP_Model_Contribution", "Due_Score_V4",
+        "Environment", "TANKS", "Porch_Shots", "Top_10_Overall",
+        "Top_4_Per_Game", "team", "opponent", "venue", "lineup_spot",
         "batter_profile_side", "pitcher_throws",
         "HR", "Barrels_approx", "EV_100_plus", "EV_100_plus_outs",
-        "Fly_375_plus", "Out_380_400", "Near_HR", "xHR_minus_HR",
+        "Fly_375_plus", "Fly_350_plus_outs", "Fly_375_plus_outs",
+        "Out_380_400", "Near_HR", "xHR_minus_HR",
         "Avg_EV", "EV90", "Max_EV", "HH_pct", "Barrel_pct_approx",
         "PullAir_pct", "SweetSpot_pct", "Pitch_Mix_Score",
         "Pitcher_BBE", "Pitcher_HR", "Pitcher_HR_pct",
@@ -1552,7 +1351,7 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Outlaw HR Scanner V5.1 — last 10 games + BvP")
+    parser = argparse.ArgumentParser(description="Outlaw HR Scanner V4 — last 10 games")
     parser.add_argument("--date", default=str(date.today()), help="YYYY-MM-DD")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--lookback-days", type=int, default=32)

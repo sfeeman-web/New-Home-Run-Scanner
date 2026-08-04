@@ -1,0 +1,29 @@
+Outlaw HR Scanner V5.2 Formula Patch
+
+MODEL WEIGHTS
+- 35% Last-10-game contact/power form
+- 35% Opposing-pitcher vulnerability, including pitch-mix compatibility
+- 25% Last-10-game near-home-run/regression indicators
+- 5% Combined park and weather
+- 0% Career batter-vs-pitcher history; displayed for reference only
+
+IMPLEMENTATION DETAILS
+- Recent Power excludes deep outs and xHR regression to prevent double-counting.
+- Pitcher Matchup Score = 75% pitcher leak by batter side + 25% pitch-mix compatibility.
+- Near-HR Score uses 100+ mph outs, 350+ foot outs, 375+ foot outs,
+  380-400 foot outs, and xHR above actual HR.
+- Park/weather internal split is 70% park and 30% weather, equal to
+  3.5% and 1.5% of the complete model.
+- BvP score, PA, HR, AVG, OBP, and SLG remain visible.
+- BvP_Model_Weight and BvP_Model_Contribution are explicitly set to zero.
+- The active scan window remains the hitter's most recent 10 games.
+
+FILES TO REPLACE
+1. scanner.py
+2. app.py
+
+VALIDATION
+- Python syntax compilation passed.
+- Exact 35/35/25/5 score reconstruction passed.
+- BvP zero-contribution test passed.
+- New deep-out metric test passed.

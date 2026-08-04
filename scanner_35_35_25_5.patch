@@ -1,0 +1,330 @@
+--- /mnt/data/scanner_before_35_35_25_5.py	2026-08-04 03:40:50.756049909 +0000
++++ /mnt/data/scanner.py	2026-08-04 03:40:51.376049921 +0000
+@@ -55,12 +55,12 @@
+ }
+ 
+ DEFAULT_WEIGHTS = {
+-    "contact_quality": 0.30,
+-    "pitcher_vulnerability": 0.25,
+-    "pitch_mix_matchup": 0.15,
+-    "park_environment": 0.15,
+-    "regression_due": 0.10,
+-    "market_value": 0.05,
++    "contact_quality": 0.35,
++    "pitcher_vulnerability": 0.35,
++    "pitch_mix_matchup": 0.00,  # folded into pitcher vulnerability
++    "park_environment": 0.05,
++    "regression_due": 0.25,
++    "market_value": 0.00,
+ }
+ 
+ 
+@@ -434,7 +434,8 @@
+             "BBE", "Avg_EV", "EV90", "Max_EV", "HH_95", "HH_pct",
+             "EV_100_plus", "EV_100_plus_outs", "Barrels_approx", "Barrel_pct_approx",
+             "Avg_LA", "SweetSpot", "SweetSpot_pct", "PullAir", "PullAir_pct",
+-            "Fly_350_plus", "Fly_375_plus", "Out_380_400", "Near_HR",
++            "Fly_350_plus", "Fly_375_plus", "Fly_350_plus_outs",
++            "Fly_375_plus_outs", "Out_380_400", "Near_HR",
+             "xHR_proxy", "xHR_minus_HR"
+         ]}
+     b["launch_speed"] = pd.to_numeric(b["launch_speed"], errors="coerce")
+@@ -458,6 +459,8 @@
+     pull_air = air & pull
+     fly_350 = (b["launch_angle"] >= 15) & (b["hit_distance_sc"] >= 350)
+     fly_375 = (b["launch_angle"] >= 15) & (b["hit_distance_sc"] >= 375)
++    fly_350_outs = b["is_out"] & fly_350
++    fly_375_outs = b["is_out"] & fly_375
+     out_380_400 = b["is_out"] & b["hit_distance_sc"].between(380, 400, inclusive="both")
+     near_hr = (
+         (b["is_out"] & (b["hit_distance_sc"] >= 375))
+@@ -482,6 +485,8 @@
+         "PullAir_pct": float(pull_air.mean()),
+         "Fly_350_plus": int(fly_350.sum()),
+         "Fly_375_plus": int(fly_375.sum()),
++        "Fly_350_plus_outs": int(fly_350_outs.sum()),
++        "Fly_375_plus_outs": int(fly_375_outs.sum()),
+         "Out_380_400": int(out_380_400.sum()),
+         "Near_HR": int(near_hr.sum()),
+         "xHR_proxy": float(b["xhr_proxy"].sum()),
+@@ -554,24 +559,23 @@
+ 
+ 
+ def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
++    """Legacy-compatible scorer using the current 35/35/25/5 macro structure."""
+     out = df.copy()
+     contact_raw = (
+-        out["Avg_EV"].fillna(out["Avg_EV"].median()) * 0.18
+-        + out["EV90"].fillna(out["EV90"].median()) * 0.16
++        out["Avg_EV"].fillna(out["Avg_EV"].median()) * 0.10
++        + out["EV90"].fillna(out["EV90"].median()) * 0.15
+         + out["Max_EV"].fillna(out["Max_EV"].median()) * 0.10
+-        + out["HH_pct"].fillna(0) * 100 * 0.16
+-        + out["Barrel_pct_approx"].fillna(0) * 100 * 0.16
+-        + out["PullAir_pct"].fillna(0) * 100 * 0.10
+-        + out["Fly_375_plus"].fillna(0) * 3.5
+-        + out["Near_HR"].fillna(0) * 2.5
++        + out["HH_pct"].fillna(0) * 100 * 0.20
++        + out["Barrel_pct_approx"].fillna(0) * 100 * 0.25
++        + out["PullAir_pct"].fillna(0) * 100 * 0.20
+     )
+     pitcher_raw = (
+         out["Pitcher_HR_pct"].fillna(0) * 100 * 0.35
+-        + out["Pitcher_HH_pct"].fillna(0) * 100 * 0.30
++        + out["Pitcher_HH_pct"].fillna(0) * 100 * 0.25
+         + out["Pitcher_Barrel_pct_approx"].fillna(0) * 100 * 0.25
+-        + out["Pitcher_Avg_EV"].fillna(85) * 0.10
++        + out["Pitcher_Avg_EV"].fillna(85) * 0.15
+     )
+-    due_raw = (
++    near_hr_raw = (
+         out["xHR_minus_HR"].fillna(0) * 20
+         + out["EV_100_plus_outs"].fillna(0) * 3
+         + out["Out_380_400"].fillna(0) * 5
+@@ -579,17 +583,18 @@
+     out["Contact_Score"] = normalize_series(contact_raw)
+     out["Pitcher_Vuln_Score"] = normalize_series(pitcher_raw)
+     out["Pitch_Mix_Score"] = out["Pitch_Mix_Score"].fillna(50).clip(0, 100)
++    out["Pitcher_Matchup_Score"] = (
++        out["Pitcher_Vuln_Score"] * 0.75 + out["Pitch_Mix_Score"] * 0.25
++    ).clip(0, 100)
+     out["Park_Env_Score"] = normalize_series(out["Park_Factor"] * out["Weather_Factor"])
+-    out["Due_Score"] = normalize_series(due_raw)
++    out["Due_Score"] = normalize_series(near_hr_raw)
+     out["Market_Value_Score"] = out["Market_Value_Score"].fillna(50).clip(0, 100)
+ 
+     out["Model_Score"] = (
+-        out["Contact_Score"] * weights["contact_quality"]
+-        + out["Pitcher_Vuln_Score"] * weights["pitcher_vulnerability"]
+-        + out["Pitch_Mix_Score"] * weights["pitch_mix_matchup"]
+-        + out["Park_Env_Score"] * weights["park_environment"]
+-        + out["Due_Score"] * weights["regression_due"]
+-        + out["Market_Value_Score"] * weights["market_value"]
++        out["Contact_Score"] * 0.35
++        + out["Pitcher_Matchup_Score"] * 0.35
++        + out["Due_Score"] * 0.25
++        + out["Park_Env_Score"] * 0.05
+     )
+     out["Qualifying_Power_Signals"] = (
+         (out["Barrels_approx"].fillna(0) >= 2).astype(int)
+@@ -616,12 +621,15 @@
+ 
+ def add_v4_scores(df: pd.DataFrame) -> pd.DataFrame:
+     """
+-    Transparent V4 engine:
+-      45% recent power (last 10 games)
+-      25% pitcher leak by batter side
+-      10% historical batter-vs-pitcher matchup
+-      10% due indicators
+-      10% environment
++    Transparent scanner engine using the user-approved macro weighting:
++      35% last-10-game contact/power form
++      35% opposing-pitcher vulnerability, including pitch-mix compatibility
++      25% last-10-game near-home-run/regression indicators
++       5% park and weather environment
++       0% career batter-vs-pitcher history (display only)
++
++    Confirmed lineup status is not required. A listed opposing pitcher is required
++    upstream. BvP statistics remain visible but never alter Power_Index.
+     """
+     out = df.copy()
+ 
+@@ -630,35 +638,37 @@
+             return pd.Series(default, index=out.index, dtype="float64")
+         return pd.to_numeric(out[col], errors="coerce").fillna(default)
+ 
+-    # Recent power profile.
++    # ------------------------------------------------------------------
++    # 35%: Last-10-game contact/power form.
++    # Deep outs and xHR regression are deliberately excluded here so they
++    # are not double-counted with the separate 25% near-HR component.
++    # ------------------------------------------------------------------
+     recent_hr = n("HR")
+     barrels = n("Barrels_approx")
+     ev100 = n("EV_100_plus")
+-    deep375 = n("Fly_375_plus")
+-    deep400 = n("Out_380_400")
+     hh = n("HH_pct")
+     pull_air = n("PullAir_pct")
+     sweet = n("SweetSpot_pct")
++    avg_ev = n("Avg_EV", 88.0)
+     ev90 = n("EV90", 95.0)
+     max_ev = n("Max_EV", 95.0)
+ 
+     out["Recent_Power"] = (
+-        _fixed_scale(recent_hr, 0, 5) * 0.18
++        _fixed_scale(recent_hr, 0, 5) * 0.10
+         + _fixed_scale(barrels, 0, 7) * 0.20
+         + _fixed_scale(ev100, 1, 16) * 0.14
+-        + _fixed_scale(deep375, 0, 7) * 0.12
+-        + _fixed_scale(deep400, 0, 4) * 0.05
+-        + _fixed_scale(hh, 0.25, 0.65) * 0.10
+-        + _fixed_scale(pull_air, 0.08, 0.38) * 0.09
+-        + _fixed_scale(sweet, 0.18, 0.48) * 0.05
+-        + _fixed_scale(ev90, 96, 111) * 0.04
+-        + _fixed_scale(max_ev, 101, 116) * 0.03
++        + _fixed_scale(hh, 0.25, 0.65) * 0.14
++        + _fixed_scale(pull_air, 0.08, 0.38) * 0.14
++        + _fixed_scale(sweet, 0.18, 0.48) * 0.08
++        + _fixed_scale(avg_ev, 84, 96) * 0.06
++        + _fixed_scale(ev90, 96, 111) * 0.08
++        + _fixed_scale(max_ev, 101, 116) * 0.06
+     ).clip(0, 100)
+ 
+-    # HR-quality contact indicators inspired by the uploaded cheat sheet.
+-    launch_angle = n("Avg_LA")
++    # HR-quality display indicators.
++    deep375 = n("Fly_375_plus")
+     out["TANKS"] = (
+-        (barrels * 0.60 + n("EV_100_plus") * 0.25 + deep375 * 0.15)
++        (barrels * 0.60 + ev100 * 0.25 + deep375 * 0.15)
+         .round()
+         .astype(int)
+     )
+@@ -668,7 +678,11 @@
+         .astype(int)
+     )
+ 
+-    # Pitcher leak with strong sample regression.
++    # ------------------------------------------------------------------
++    # 35%: Pitcher vulnerability by projected batter side.
++    # Pitch-type compatibility is nested inside this category rather than
++    # receiving a separate macro weight.
++    # ------------------------------------------------------------------
+     p_bbe = n("Pitcher_BBE")
+     p_hr = n("Pitcher_HR_pct")
+     p_barrel = n("Pitcher_Barrel_pct_approx")
+@@ -683,23 +697,39 @@
+         + _fixed_scale(p_ev, 84, 93) * 0.15
+     )
+     out["Pitcher_Leak"] = (50 + (raw_pitcher - 50) * reliability).clip(0, 100)
++    out["Pitch_Mix_Score"] = n("Pitch_Mix_Score", 50.0).clip(0, 100)
++    out["Pitcher_Matchup_Score"] = (
++        out["Pitcher_Leak"] * 0.75 + out["Pitch_Mix_Score"] * 0.25
++    ).clip(0, 100)
+     out["Pitcher_Sample"] = p_bbe.astype(int)
+     out["Pitcher_Sample_Flag"] = ""
+     out.loc[p_bbe < 25, "Pitcher_Sample_Flag"] = "⚠ SMALL SAMPLE"
+ 
+-    # Due meter.
++    # ------------------------------------------------------------------
++    # 25%: Near-home-run / regression signals from the same last 10 games.
++    # These are isolated from Recent_Power to prevent double-counting.
++    # ------------------------------------------------------------------
++    fly350_outs = n("Fly_350_plus_outs")
++    fly375_outs = n("Fly_375_plus_outs")
+     due_raw = (
+-        _fixed_scale(n("EV_100_plus_outs"), 0, 8) * 0.30
+-        + _fixed_scale(n("Out_380_400"), 0, 4) * 0.25
+-        + _fixed_scale(n("Near_HR"), 0, 5) * 0.25
++        _fixed_scale(n("EV_100_plus_outs"), 0, 8) * 0.25
++        + _fixed_scale(fly350_outs, 0, 6) * 0.15
++        + _fixed_scale(fly375_outs, 0, 4) * 0.20
++        + _fixed_scale(n("Out_380_400"), 0, 4) * 0.20
+         + _fixed_scale(n("xHR_minus_HR"), 0, 2.5) * 0.20
+     )
+-    out["Due_Score_V4"] = due_raw.clip(0, 100)
++    out["Near_HR_Score"] = due_raw.clip(0, 100)
++    # Backward-compatible alias used by the existing Streamlit tabs/export.
++    out["Due_Score_V4"] = out["Near_HR_Score"]
+     out["Due_Meter"] = "🟡 NEUTRAL"
+     out.loc[(due_raw >= 65) & (recent_hr <= 2), "Due_Meter"] = "🟢 DUE"
+-    out.loc[(recent_hr >= 3), "Due_Meter"] = "🔥 PRODUCING"
++    out.loc[recent_hr >= 3, "Due_Meter"] = "🔥 PRODUCING"
+ 
+-    # Environment capped so it cannot dominate.
++    # ------------------------------------------------------------------
++    # 5%: Combined park and weather.
++    # Internal split: 70% park / 30% weather, equal to 3.5% and 1.5% of
++    # the full model. This category is intentionally capped at 5% total.
++    # ------------------------------------------------------------------
+     park = n("Park_Factor", 1.0)
+     weather = n("Weather_Factor", 1.0)
+     out["Environment"] = (
+@@ -707,7 +737,7 @@
+         + _fixed_scale(weather, 0.94, 1.06) * 0.30
+     ).clip(0, 100)
+ 
+-    # Historical batter-vs-pitcher score with strong sample regression.
++    # Career BvP remains available for reference only (0% model weight).
+     bvp_pa = n("BvP_PA")
+     bvp_hr = n("BvP_HR")
+     bvp_avg = n("BvP_AVG", 0.250)
+@@ -719,35 +749,36 @@
+     )
+     bvp_reliability = (bvp_pa / 25.0).clip(0, 1)
+     out["BvP_Score"] = (50 + (bvp_raw - 50) * bvp_reliability).clip(0, 100)
++    out["BvP_Model_Weight"] = 0.0
++    out["BvP_Model_Contribution"] = 0.0
+     out["BvP_Sample_Flag"] = ""
+     out.loc[(bvp_pa > 0) & (bvp_pa < 10), "BvP_Sample_Flag"] = "⚠ SMALL BvP"
+     out.loc[bvp_pa == 0, "BvP_Sample_Flag"] = "NO HISTORY"
+ 
+-    # Transparent composite. Recent form remains the largest input.
++    # Exact macro weighting: 35 / 35 / 25 / 5. BvP contributes zero.
+     out["Power_Index"] = (
+-        out["Recent_Power"] * 0.45
+-        + out["Pitcher_Leak"] * 0.25
+-        + out["BvP_Score"] * 0.10
+-        + out["Due_Score_V4"] * 0.10
+-        + out["Environment"] * 0.10
++        out["Recent_Power"] * 0.35
++        + out["Pitcher_Matchup_Score"] * 0.35
++        + out["Near_HR_Score"] * 0.25
++        + out["Environment"] * 0.05
+     ).clip(0, 100)
+ 
+-    # Bounded, display-only model estimate.
++    # Bounded display estimate; rankings are controlled by Power_Index.
+     likelihood = 0.035 + 0.255 / (1 + np.exp(-(out["Power_Index"] - 66) / 8.5))
+     out["HR_Likelihood_pct"] = (likelihood * 100).round().astype(int)
+     out["HR_Likelihood"] = out["HR_Likelihood_pct"].astype(str) + "%"
+ 
+-    # Conviction and best market.
++    # Existing labels retained for backward compatibility.
+     out["Conviction"] = "HR LEAN"
+     out.loc[out["Power_Index"] >= 62, "Conviction"] = "🔥 SOLID"
+     out.loc[out["Power_Index"] >= 72, "Conviction"] = "🔥🔥 FIRED"
+-    out.loc[(out["Due_Score_V4"] >= 70) & (out["Power_Index"] < 72), "Conviction"] = "🎯 DUE"
++    out.loc[(out["Near_HR_Score"] >= 70) & (out["Power_Index"] < 72), "Conviction"] = "🎯 DUE"
+ 
+     out["Best_Look"] = "HR LEAN"
+     out.loc[(out["Power_Index"] >= 68) & (out["Recent_Power"] >= 65), "Best_Look"] = "HR"
+-    out.loc[(out["Due_Score_V4"] >= 70) & (out["Recent_Power"] >= 50), "Best_Look"] = "LONGSHOT HR"
++    out.loc[(out["Near_HR_Score"] >= 70) & (out["Recent_Power"] >= 50), "Best_Look"] = "LONGSHOT HR"
+     out.loc[(pull_air < 0.12) & (n("AVG") >= 0.275), "Best_Look"] = "2+ TB / HRR"
+-    out.loc[(out["Recent_Power"] < 35) & (out["Pitcher_Leak"] < 45), "Best_Look"] = "SKIP HR"
++    out.loc[(out["Recent_Power"] < 35) & (out["Pitcher_Matchup_Score"] < 45), "Best_Look"] = "SKIP HR"
+ 
+     # Player display + platoon.
+     batter_side = out.get("batter_profile_side", pd.Series("U", index=out.index)).fillna("U").astype(str).str.upper()
+@@ -765,7 +796,7 @@
+ 
+     # Rank overall and within each game.
+     out = out.sort_values(
+-        ["Power_Index", "Recent_Power", "Pitcher_Leak"],
++        ["Power_Index", "Recent_Power", "Pitcher_Matchup_Score"],
+         ascending=[False, False, False],
+     ).reset_index(drop=True)
+     out["Overall_Rank"] = np.arange(1, len(out) + 1)
+@@ -1266,14 +1297,17 @@
+         "Overall_Rank", "Game_Rank", "Player_Display", "HR_Likelihood",
+         "Best_Look", "Conviction", "Hot_Symbol", "Due_Meter",
+         "opposing_pitcher", "Pitcher_Sample_Flag", "Pitcher_Sample",
+-        "Power_Index", "Recent_Power", "Pitcher_Leak", "BvP_Score",
++        "Power_Index", "Recent_Power", "Pitcher_Leak",
++        "Pitcher_Matchup_Score", "Near_HR_Score", "BvP_Score",
+         "BvP_PA", "BvP_AB", "BvP_H", "BvP_HR", "BvP_AVG", "BvP_OBP",
+-        "BvP_SLG", "BvP_Sample_Flag", "Due_Score_V4",
++        "BvP_SLG", "BvP_Sample_Flag", "BvP_Model_Weight",
++        "BvP_Model_Contribution", "Due_Score_V4",
+         "Environment", "TANKS", "Porch_Shots", "Top_10_Overall",
+         "Top_4_Per_Game", "team", "opponent", "venue", "lineup_spot",
+         "batter_profile_side", "pitcher_throws",
+         "HR", "Barrels_approx", "EV_100_plus", "EV_100_plus_outs",
+-        "Fly_375_plus", "Out_380_400", "Near_HR", "xHR_minus_HR",
++        "Fly_375_plus", "Fly_350_plus_outs", "Fly_375_plus_outs",
++        "Out_380_400", "Near_HR", "xHR_minus_HR",
+         "Avg_EV", "EV90", "Max_EV", "HH_pct", "Barrel_pct_approx",
+         "PullAir_pct", "SweetSpot_pct", "Pitch_Mix_Score",
+         "Pitcher_BBE", "Pitcher_HR", "Pitcher_HR_pct",
