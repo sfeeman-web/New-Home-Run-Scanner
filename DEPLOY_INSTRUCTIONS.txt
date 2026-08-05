@@ -1,0 +1,18 @@
+STREAMLIT CLOUD DEPLOYMENT FIX
+
+1. Upload app.py, scanner.py, and requirements.txt to the ROOT of the GitHub repository.
+2. Replace the existing files with these versions.
+3. In Streamlit Community Cloud, delete the failed app deployment.
+4. Create the app again from the same repository and branch.
+5. Open Advanced settings before deploying.
+6. Select Python 3.12 (not Python 3.14).
+7. Set the main file path to app.py.
+8. Deploy.
+
+WHY THIS FIX WORKS
+- The failed deployment used Python 3.14.6 and resolved Starlette 1.4.0.
+- Streamlit's gzip middleware then called a Starlette responder with an incompatible constructor.
+- requirements.txt now pins Starlette to 0.47.3 and pins all primary dependencies.
+- Redeploying is required because Streamlit Cloud cannot change an existing app's Python version in place.
+
+If the old environment is reused, delete the app deployment rather than only rebooting it.

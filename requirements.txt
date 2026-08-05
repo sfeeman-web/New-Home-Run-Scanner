@@ -1,5 +1,6 @@
-streamlit>=1.59,<1.60
-pandas>=2.2,<3.0
-numpy>=1.26,<3.0
-requests>=2.31,<3.0
-xlsxwriter>=3.2,<4.0
+streamlit==1.59.2
+starlette==0.47.3
+pandas==2.3.3
+numpy==2.5.1
+requests==2.34.2
+xlsxwriter==3.2.9
